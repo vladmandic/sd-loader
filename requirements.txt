@@ -1,0 +1,9 @@
+einops
+numpy
+omegaconf
+Pillow
+psutil
+pytorch_lightning
+rich
+safetensors
+torch

@@ -1,26 +1,36 @@
+#!/bin/env python
+
+# system imports
 import io
 import os
 import gc
 import time
 import warnings
+import argparse
+
+# library imports
+import psutil
 import torch
 import safetensors
-import ldm.util
-import psutil
 import pytorch_lightning # pylint: disable=unused-import
 from omegaconf import OmegaConf
 from rich.pretty import install as pretty_install
 from rich.traceback import install as traceback_install
 from rich.console import Console
 
+# modules imports: this is unmodified sd code
+import ldm.util
 
-repeats = 3
-checkpoint_folder = '/mnt/d/Models' # update path with your location
-checkpoint_files = [ # download files from (https://huggingface.co/stabilityai/stable-diffusion-2-1/tree/main)
-    'v2-1_768-ema-pruned.ckpt',
-    'v2-1_768-ema-pruned.safetensors'
-]
-checkpoint_config = 'v2-inference-768-v.yaml'
+
+# parse arguments
+parser = argparse.ArgumentParser(description = 'sd-loader')
+parser.add_argument('--model', type=str, default=None, required=True, help='model name')
+parser.add_argument('--method', type=str, default=None, choices=['file', 'stream'], required=True, help='load method')
+parser.add_argument('--repeats', type=int, default=3, required=False, help='number of repeats')
+parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'], required=False, help='load initial target')
+parser.add_argument('--config', type=str, default='v2-inference-768-v.yaml', required=False, help='model config')
+parser.add_argument('--dtype', type=str, default='fp16', choices=['fp32', 'fp16', 'bf16'], required=False, help='target dtype')
+args = parser.parse_args()
 
 
 class Logger:
@@ -43,78 +53,73 @@ class Logger:
         self.t = time.perf_counter()
 
     def trace(self, msg: str):
-        gc_start = time.perf_counter()
-        gc.collect()
-        with torch.no_grad():
-            torch.cuda.empty_cache()
-        with torch.cuda.device('cuda'):
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
         cpu = self.gb(self.process.memory_info().rss)
         gpu_info = torch.cuda.mem_get_info()
         gpu = self.gb(gpu_info[1] - gpu_info[0])
-        gc_time = round(time.perf_counter() - gc_start, 3)
-        self.console.log(f'{round(gc_start - self.t, 3)} {msg} (cpu: {cpu} gpu: {gpu} gc: {gc_time})')
-        self.t = time.perf_counter()
+        t = time.perf_counter()
+        self.console.log(f'{round(t - self.t, 3)} {msg} (cpu: {cpu} gpu: {gpu})')
+        self.t = t
 logger = Logger()
 
 
-def load_weights(checkpoint_file, load_method):
-    _, extension = os.path.splitext(checkpoint_file)
-    if load_method == 'stream':
-        with open(checkpoint_file,'rb') as f:
+def garbage_collect():
+    gc.collect()
+    with torch.no_grad():
+        torch.cuda.empty_cache()
+    with torch.cuda.device('cuda'):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    logger.trace('garbage collect')
+
+
+def load_model():
+    logger.start()
+
+    model_config = OmegaConf.load(args.config)
+    model = ldm.util.instantiate_from_config(model_config.model)
+    logger.trace(f'create model: {model_config.model["target"]} from {{args.config}}')
+
+    _, extension = os.path.splitext(args.model)
+    if args.method == 'stream':
+        with open(args.model,'rb') as f:
             if extension.lower()=='.safetensors':
                 buffer = f.read()
                 weights = safetensors.torch.load(buffer)
             else:
                 buffer = io.BytesIO(f.read())
-                weights = torch.load(buffer, map_location='cpu')
-    elif load_method == 'file':
+                weights = torch.load(buffer, map_location=args.device)
+    elif args.method == 'file':
         if extension.lower()=='.safetensors':
-            weights = safetensors.torch.load_file(checkpoint_file, device='cpu')
+            weights = safetensors.torch.load_file(args.model, device=args.device)
         else:
-            weights = torch.load(checkpoint_file, map_location='cpu')
-    return weights
-
-
-def load_model(checkpoint_file, load_method):
-    logger.start()
-
-    model_config = OmegaConf.load(checkpoint_config)
-    logger.trace(f'load config: {checkpoint_config}')
-    model = ldm.util.instantiate_from_config(model_config.model)
-    logger.trace(f'create model: {model_config.model["target"]}')
-
-    weights = load_weights(checkpoint_file, load_method)
-    logger.trace(f'load weights: {checkpoint_file}')
+            weights = torch.load(args.model, map_location=args.device)
+    logger.trace(f'load weights: {args.model}')
 
     state_dict = weights.pop('state_dict', weights)
     state_dict.pop('state_dict', None)
-    logger.trace(f'state dict: {len(state_dict)}')
 
     model.load_state_dict(state_dict, strict=False)
-    weights = None # unload weigts since they were applied to model
-    logger.trace('apply weigths')
+    del weights # unload weigts since they were applied to model
+    logger.trace(f'apply weigths to dict: {len(state_dict)})')
 
-    model.to(torch.float16)
+    dtype = torch.float32 if args.dtype == 'fp32' else torch.float16 if args.dtype == 'fp16' else torch.bfloat16
+    model.to(dtype)
     model.eval()
     logger.trace('model eval')
 
     model.to('cuda')
     logger.trace('model move')
 
-    model = None
-    logger.trace('model unload')
-    return model # pointless since its unloaded
+    return model
 
 
 if __name__ == '__main__':
     logger.log(f'torch: {torch.__version__} cuda: {torch.version.cuda} cudnn: {torch.backends.cudnn.version()} gpu: {torch.cuda.get_device_name()} capability: {torch.cuda.get_device_capability()}')
-    for fn in checkpoint_files:
-        for method in ['file', 'stream']:
-            logger.log(f'start tests using {method} method')
-            for i in range(repeats):
-                t0 = time.perf_counter()
-                logger.log(f'load model {fn} using {method} method pass {i + 1} of {repeats} start')
-                sd = load_model(os.path.join(checkpoint_folder, fn), method)
-                logger.log(f'load model {fn} using {method} method pass {i + 1} of {repeats} in {round(time.perf_counter() - t0, 3)} seconds')
+    logger.log(f'options: {vars(args)}')
+    for i in range(args.repeats):
+        t0 = time.perf_counter()
+        sd = load_model()
+        logger.log(f'load model pass {i + 1}: {round(time.perf_counter() - t0, 3)} seconds')
+        del sd # unload model
+        garbage_collect()

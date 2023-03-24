@@ -1,11 +1,13 @@
 # sd-loader
 
 Stable Diffusion model loader tool with benchmark:
+
 - comparing **file** and **stream** loading methods
 - for both `torch` checkpoint and `safetensors` formats
 
 1. Install requirements
-2. Download models
+2. Download models  
+   Example: download both `ckpt` and `safetensor` from <https://huggingface.co/stabilityai/stable-diffusion-2-1/tree/main>
 3. Update paths and model names in `bench.py`
 4. Run
 
